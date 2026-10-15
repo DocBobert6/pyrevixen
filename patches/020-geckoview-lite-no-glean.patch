@@ -1,0 +1,482 @@
+# =============================================================================
+# 020-geckoview-lite-no-glean.patch — PyreVixen: GeckoView Lite, no Glean,
+# no Sentry, no Adjust, no crash submission
+#
+# WHAT THIS DOES
+#   1. GeckoView Lite: build against the non-Omni GeckoView artifact, which
+#      excludes the Glean native library baked into geckoview-*-omni.
+#   2. Removes the Glean SDK, Sentry, Adjust and InstallReferrer dependencies.
+#   3. Guts the telemetry/crash-report wiring: Glean is never initialized
+#      (single choke point no-op'd), Sentry/Socorro crash services are
+#      deleted, the metrics controller registers zero services, and the
+#      CRASH_REPORTING / TELEMETRY / SENTRY_TOKEN / ADJUST_TOKEN build flags
+#      are forced off.
+#
+#
+# VERIFIED AGAINST: FIREFOX-ANDROID_158_0_RELEASE (2026-10-14).
+#   * GeckoView Lite is REAL and is selected by the mozconfig flag
+#     --enable-geckoview-lite: mobile/android/moz.configure:81
+#       set_config("MOZ_ANDROID_GECKOVIEW_LITE", True, when="--enable-geckoview-lite")
+#     consumed by android-components/components/browser/engine-gecko/build.gradle
+#     computeArtifactId(): without the flag the artifact is geckoview[-channel]-omni
+#     (Omni = includes Glean native, per Firefox source docs "GeckoView
+#     Architecture": the default `geckoview` build "does not contain such
+#     libraries" and "is similarly dubbed Lite in the codebase").
+#     => There is NO source hunk for Lite: a source patch cannot set a mozconfig
+#     flag. The fork's CI mozconfig MUST contain:
+#         ac_add_options --enable-geckoview-lite
+#   * There is NO buildSrc/src/main/java/Gecko.kt or Dependencies.kt in this
+#     tree (the first draft targeted files that do not exist), and
+#     fenix/app/build.gradle is Groovy, not .kts. The real dependency lines
+#     removed here are fenix/app/build.gradle: service-glean (project dep),
+#     libs.mozilla.glean, libs.mozilla.glean.forUnitTests, the
+#     org.mozilla.telemetry.glean-gradle-plugin application, lib-crash-sentry
+#     (project dep), libs.sentry, libs.adjust, libs.installreferrer.
+#   * The only Glean.initialize call site in the app is
+#     GleanHelper.initializeGlean (components/GleanHelper.kt:64), called from
+#     FenixApplication.maybeInitializeGlean(). No-op'ing it kills all Glean
+#     init. (Glean cannot upload without initialize(); uploadEnabled defaults
+#     to false.)
+#   * Sentry: Analytics.isSentryEnabled() (components/Analytics.kt:200) gated
+#     the SentryService block; both are deleted here, as is the
+#     MozillaSocorroService block, the GleanCrashReporterService telemetry
+#     service, the ExperimentDataRuntimeTagProvider (Nimbus enrollment tags),
+#     and the Glean/Adjust/InstallReferrer/usage-reporting entries in the
+#     MetricController service list.
+#   * Settings.isTelemetryEnabled default true -> false (utils/Settings.kt).
+#
+# DELIBERATE DEVIATIONS FROM THE FIRST DRAFT
+#   * The first draft's buildSrc hunks are dropped: those files do not exist.
+#   * Beyond dependency removal, this patch also deletes the init/call sites
+#     (the first draft left them as best-effort comments), and additionally
+#     removes Adjust + InstallReferrer (third-party attribution telemetry the
+#     first draft missed).
+#
+# CONFIDENCE
+#   * All hunks in THIS patch: CONFIDENT — every removed line was copied
+#     verbatim from the 158.0 tree and the patch was verified with
+#     `git apply --check`.
+#   * REQUIRED FOLLOW-UP (first CI build, cannot be done by patch): deleting
+#     the Glean SDK + glean-gradle-plugin stops generation of
+#     org.mozilla.fenix.GleanMetrics.*, which 145 files reference
+#     (rg -l "GleanMetrics\." fenix/app/src/main/java | wc -l → 145), and
+#     76 files import mozilla.telemetry.glean.*. Every one of those references
+#     must be deleted; the compile errors are the checklist:
+#         rg -l "GleanMetrics\.|mozilla\.telemetry\.glean" fenix/app/src/main/java
+#     Also: com.adjust.sdk.* (AdjustMetricsService.kt, AdjustSdkController.kt,
+#     AdjustThirdPartySharingController.kt), com.android.installreferrer.*
+#     (DefaultInstallReferrerClient.kt, InstallReferrerClientWrapper.kt, ...),
+#     and the secret-settings Glean debug tools
+#     (debugsettings/gleandebugtools/). The GleanMetrics-free tree is the
+#     definition of done for this patch.
+#   * Gecko-side telemetry prefs (toolkit.telemetry.*, datareporting.*,
+#     toolkit.crashreporter.*) remain enforced via config/default-prefs.js,
+#     which is outside the patches/ directory.
+# =============================================================================
+
+diff --git a/mobile/android/fenix/app/build.gradle b/mobile/android/fenix/app/build.gradle
+index fd141ec..bff613f 100644
+--- a/mobile/android/fenix/app/build.gradle
++++ b/mobile/android/fenix/app/build.gradle
+@@ -318,27 +318,20 @@ androidComponents {
+ // -------------------------------------------------------------------------------------------------
+ 
+ android.defaultConfig.with {
+-    buildConfigField 'boolean', 'CRASH_REPORTING', 'true'
+-    buildConfigField 'boolean', 'TELEMETRY', 'true'
++    // PYREVIXEN: crash reporting and telemetry are never compiled in.
++    buildConfigField 'boolean', 'CRASH_REPORTING', 'false'
++    buildConfigField 'boolean', 'TELEMETRY', 'false'
+ 
+-    // Reading the sentry token from a local file (if it exists). In a release task on taskcluster it will be available.
++    // PYREVIXEN: no Sentry token is ever baked in (see Analytics.kt).
+     buildConfigField 'String', 'SENTRY_TOKEN', 'null'
+-    try {
+-        def token = new File("${rootDir}/.sentry_token").text.trim()
+-        buildConfigField 'String', 'SENTRY_TOKEN', '"' + token + '"'
+-    } catch (FileNotFoundException ignored) {}
+ 
+     // Setting buildDate with every build ID changes the generated BuildConfig and slows down the
+     // build, so debug builds (overridden below) use a fixed string instead.
+     def buildDate = LocalDateTime.parse(getBuildId(gradle.mozconfig.topobjdir, providers.environmentVariable("MOZ_BUILD_DATE").getOrNull()), DateTimeFormatter.ofPattern("yyyyMMddHHmmss")).toString()
+     buildConfigField 'String', 'BUILD_DATE', '"' + buildDate + '"'
+ 
+-    try {
+-        def token = new File("${rootDir}/.adjust_token").text.trim()
+-        buildConfigField 'String', 'ADJUST_TOKEN', '"' + token + '"'
+-    } catch (FileNotFoundException ignored) {
+-        buildConfigField 'String', 'ADJUST_TOKEN', 'null'
+-    }
++    // PYREVIXEN: no Adjust token is ever baked in (Adjust SDK removed).
++    buildConfigField 'String', 'ADJUST_TOKEN', 'null'
+ 
+     try {
+         def url = new File("${rootDir}/.nimbus").text.trim()
+@@ -364,12 +357,8 @@ android.defaultConfig.with {
+         buildConfigField 'String', 'GPS_INTEGRITY_TOKEN', '""'
+     }
+ 
+-    if (gradle.hasProperty("localProperties.glean.custom.server.url")) {
+-        def url = gradle.getProperty("localProperties.glean.custom.server.url")
+-        buildConfigField 'String', 'GLEAN_CUSTOM_URL', url
+-    } else {
+-        buildConfigField 'String', 'GLEAN_CUSTOM_URL', 'null'
+-    }
++    // PYREVIXEN: no Glean custom server URL (Glean SDK removed).
++    buildConfigField 'String', 'GLEAN_CUSTOM_URL', 'null'
+ 
+     if (project.hasProperty("official") || gradle.hasProperty("localProperties.official")) {
+         buildConfigField 'Boolean', 'MOZILLA_OFFICIAL', 'true'
+@@ -415,14 +404,7 @@ android.buildTypes.debug.with {
+     buildConfigField 'String', 'SECRET_SETTINGS_OVERRIDES', '"' + secretSettingsOverrides + '"'
+ }
+ 
+-// Generate Kotlin code for the Fenix Glean metrics.
+-ext {
+-    // Enable expiration by major version.
+-    gleanExpireByVersion = Config.majorVersion(project)
+-    gleanNamespace = "mozilla.telemetry.glean"
+-    gleanPythonEnvDir = gradle.mozconfig.substs.GRADLE_GLEAN_PARSER_VENV
+-}
+-apply plugin: "org.mozilla.telemetry.glean-gradle-plugin"
++// PYREVIXEN: Glean SDK removed - no telemetry framework is shipped.
+ 
+ nimbus {
+     // The path to the Nimbus feature manifest file
+@@ -515,7 +497,6 @@ dependencies {
+     implementation project(':components:service-digitalassetlinks')
+     implementation project(':components:service-firefox-accounts')
+     implementation project(":components:service-firefox-relay")
+-    implementation project(':components:service-glean')
+     implementation project(':components:service-location')
+     implementation project(':components:service-mars')
+     implementation project(':components:service-merino-manifest')
+@@ -542,7 +523,6 @@ dependencies {
+     implementation project(':components:lib-bookmark-parser-jsoup')
+     implementation project(':components:lib-passwords-file')
+     implementation project(':components:lib-crash')
+-    implementation project(':components:lib-crash-sentry')
+     implementation project(':components:lib-dataprotect')
+     implementation project(':components:lib-push-firebase')
+     implementation project(':components:lib-state')
+@@ -555,7 +535,6 @@ dependencies {
+     implementation ComponentsDependencies.mozilla_appservices_syncmanager
+ 
+     implementation libs.accompanist.drawablepainter
+-    implementation libs.adjust
+     implementation libs.androidx.activity
+     implementation libs.androidx.annotation
+     implementation libs.androidx.appcompat
+@@ -602,15 +581,12 @@ dependencies {
+     implementation libs.androidx.viewpager2
+     implementation libs.androidx.work.runtime
+     implementation libs.google.material
+-    implementation libs.installreferrer
+     implementation libs.kotlinx.coroutines
+     implementation libs.kotlinx.serialization.json
+-    implementation libs.mozilla.glean
+     implementation libs.play.review
+     implementation libs.play.review.ktx
+     implementation libs.play.services.ads.id
+     implementation libs.protobuf.javalite
+-    implementation libs.sentry
+     implementation libs.androidx.documentfile
+     implementation libs.zxing
+ 
+@@ -641,7 +617,6 @@ dependencies {
+     testImplementation libs.kotlin.test
+     testImplementation libs.kotlinx.coroutines.test
+     testImplementation libs.mockk
+-    testImplementation libs.mozilla.glean.forUnitTests
+     testImplementation libs.robolectric
+ 
+     androidTestImplementation project(':components:support-android-test')
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Analytics.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Analytics.kt
+index 6774a4e..e5710c3 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Analytics.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Analytics.kt
+@@ -4,7 +4,6 @@
+ 
+ package org.mozilla.fenix.components
+ 
+-import android.app.Application
+ import android.app.PendingIntent
+ import android.content.Context
+ import android.content.Intent
+@@ -12,43 +11,22 @@ import android.os.Build
+ import mozilla.components.lib.crash.CrashReporter
+ import mozilla.components.lib.crash.runtimetagproviders.BuildRuntimeTagProvider
+ import mozilla.components.lib.crash.runtimetagproviders.EnvironmentRuntimeProvider
+-import mozilla.components.lib.crash.runtimetagproviders.ExperimentDataRuntimeTagProvider
+ import mozilla.components.lib.crash.runtimetagproviders.VersionInfoProvider
+-import mozilla.components.lib.crash.sentry.SentryService
+-import mozilla.components.lib.crash.sentry.eventprocessors.CrashMetadataEventProcessor
+ import mozilla.components.lib.crash.service.CrashReporterService
+-import mozilla.components.lib.crash.service.GleanCrashReporterService
+-import mozilla.components.lib.crash.service.socorro.MozillaSocorroService
+ import mozilla.components.lib.crash.store.CrashReportOption
+-import mozilla.components.support.ktx.android.content.isMainProcess
+ import mozilla.components.support.utils.Browsers
+ import mozilla.components.support.utils.RunWhenReadyQueue
+ import mozilla.components.support.utils.ext.packageManagerCompatHelper
+-import org.mozilla.fenix.BuildConfig
+-import org.mozilla.fenix.Config
+ import org.mozilla.fenix.HomeActivity
+ import org.mozilla.fenix.R
+-import org.mozilla.fenix.ReleaseChannel
+-import org.mozilla.fenix.components.metrics.AdjustMetricsService
+ import org.mozilla.fenix.components.metrics.DefaultMetricsStorage
+-import org.mozilla.fenix.components.metrics.FirstSessionMetricsService
+-import org.mozilla.fenix.components.metrics.GleanMetricsService
+-import org.mozilla.fenix.components.metrics.GleanProfileIdPreferenceStore
+-import org.mozilla.fenix.components.metrics.GleanUsageReportingMetricsService
+-import org.mozilla.fenix.components.metrics.InstallReferrerMetricsService
+ import org.mozilla.fenix.components.metrics.MetricController
+ import org.mozilla.fenix.components.metrics.MetricsStorage
+ import org.mozilla.fenix.crashes.CrashFactCollector
+-import org.mozilla.fenix.crashes.NimbusExperimentDataProvider
+ import org.mozilla.fenix.crashes.ReleaseRuntimeTagProvider
+ import org.mozilla.fenix.crashes.crashReportOption
+-import org.mozilla.fenix.ext.getCustomGleanServerUrlIfAvailable
+ import org.mozilla.fenix.perf.lazyMonitored
+ import org.mozilla.fenix.utils.Settings
+-import org.mozilla.geckoview.BuildConfig.MOZ_APP_BUILDID
+-import org.mozilla.geckoview.BuildConfig.MOZ_APP_VENDOR
+-import org.mozilla.geckoview.BuildConfig.MOZ_APP_VERSION
+-import org.mozilla.geckoview.BuildConfig.MOZ_UPDATE_CHANNEL
+ 
+ /** Component group for all functionality related to analytics e.g. crash reporting and telemetry. */
+ class Analytics(
+@@ -59,48 +37,6 @@ class Analytics(
+ ) {
+     val crashReporter: CrashReporter by lazyMonitored {
+         val services = mutableListOf<CrashReporterService>()
+-        val distributionId = "Mozilla"
+-
+-        if (isSentryEnabled()) {
+-            val sentryService =
+-                SentryService(
+-                    context,
+-                    BuildConfig.SENTRY_TOKEN,
+-                    tags =
+-                        mapOf(
+-                            "geckoview" to "$MOZ_APP_VERSION-$MOZ_APP_BUILDID",
+-                            "fenix.git" to BuildConfig.VCS_HASH,
+-                        ),
+-                    environment = BuildConfig.BUILD_TYPE,
+-                    sendEventForNativeCrashes = false, // Do not send native crashes to Sentry
+-                    // Do not send diagnostic logs until we have a better way to toggle this from user settings.
+-                    sendCaughtExceptions = false,
+-                    sentryProjectUrl = getSentryProjectUrl(),
+-                    crashMetadataEventProcessor = CrashMetadataEventProcessor(),
+-                )
+-
+-            // We only want to initialize Sentry on startup on the main process.
+-            if (context.isMainProcess()) {
+-                runWhenReadyQueue.runIfReadyOrQueue {
+-                    sentryService.initIfNeeded()
+-                }
+-            }
+-
+-            services.add(sentryService)
+-        }
+-
+-        // The name "Fenix" here matches the product name on Socorro and is unrelated to the actual app name:
+-        // https://bugzilla.mozilla.org/show_bug.cgi?id=1523284
+-        val socorroService =
+-            MozillaSocorroService(
+-                context,
+-                appName = "Fenix",
+-                vendor = MOZ_APP_VENDOR,
+-                releaseChannel = MOZ_UPDATE_CHANNEL,
+-                distributionId = distributionId,
+-            )
+-        services.add(socorroService)
+-
+         val intent =
+             Intent(context, HomeActivity::class.java).apply {
+                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+@@ -119,33 +55,15 @@ class Analytics(
+                 crashReportingIntentFlags,
+             )
+ 
+-        val gleanServerEndpoint =
+-            if (Config.channel.isNightlyOrDebug) {
+-                // for testing, if custom glean server url is set in the secret menu, use it to initialize Glean
+-                getCustomGleanServerUrlIfAvailable(context)
+-            } else {
+-                null
+-            }
+-
+         CrashReporter(
+             context = context,
+             services = services,
+-            telemetryServices =
+-                listOf(
+-                    GleanCrashReporterService(
+-                        context,
+-                        appChannel = MOZ_UPDATE_CHANNEL,
+-                        appVersion = MOZ_APP_VERSION,
+-                        appBuildId = MOZ_APP_BUILDID,
+-                        isUploadEnabled = settings.isTelemetryEnabled,
+-                        serverEndpoint = gleanServerEndpoint,
+-                    )
+-                ),
++            telemetryServices = emptyList(),
+             shouldPrompt = CrashReporter.Prompt.ALWAYS,
+             promptConfiguration =
+                 CrashReporter.PromptConfiguration(
+                     appName = context.getString(R.string.app_name),
+-                    organizationName = "Mozilla",
++                    organizationName = "PyreVixen",
+                 ),
+             enabled = true,
+             nonFatalCrashIntent = pendingIntent,
+@@ -155,9 +73,6 @@ class Analytics(
+                     ReleaseRuntimeTagProvider(),
+                     BuildRuntimeTagProvider(context.versionInfoProvider),
+                     EnvironmentRuntimeProvider(),
+-                    ExperimentDataRuntimeTagProvider(
+-                        NimbusExperimentDataProvider(getEnrollments = nimbusComponents::getEnrollmentsForCrashReporter)
+-                    ),
+                 ),
+         )
+     }
+@@ -175,18 +90,11 @@ class Analytics(
+     }
+ 
+     val metrics: MetricController by lazyMonitored {
++        // PYREVIXEN: no metrics services are registered. Glean, Adjust,
++        // InstallReferrer and usage-reporting SDKs are removed entirely;
++        // MetricController keeps working with an empty service list.
+         MetricController.create(
+-            listOf(
+-                GleanMetricsService(context),
+-                AdjustMetricsService(
+-                    application = context as Application,
+-                    storage = metricsStorage,
+-                    crashReporter = crashReporter,
+-                ),
+-                FirstSessionMetricsService(context),
+-                InstallReferrerMetricsService(context, settings),
+-                GleanUsageReportingMetricsService(gleanProfileIdStore = GleanProfileIdPreferenceStore(context)),
+-            ),
++            listOf(),
+             isDataTelemetryEnabled = { settings.isTelemetryEnabled },
+             isMarketingDataTelemetryEnabled = {
+                 settings.isMarketingTelemetryEnabled && settings.hasMadeMarketingTelemetrySelection
+@@ -197,18 +105,6 @@ class Analytics(
+     }
+ }
+ 
+-private fun isSentryEnabled() = !BuildConfig.SENTRY_TOKEN.isNullOrEmpty()
+-
+-private fun getSentryProjectUrl(): String? {
+-    val baseUrl = "https://sentry.io/organizations/mozilla/issues"
+-    return when (Config.channel) {
+-        ReleaseChannel.Nightly -> "$baseUrl/?project=6295546"
+-        ReleaseChannel.Release -> "$baseUrl/?project=6375561"
+-        ReleaseChannel.Beta -> "$baseUrl/?project=6295551"
+-        else -> null
+-    }
+-}
+-
+ private val Context.versionInfoProvider: VersionInfoProvider
+     get() {
+         val packageInfo =
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/GleanHelper.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/GleanHelper.kt
+index dbf8238..ac48b92 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/GleanHelper.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/GleanHelper.kt
+@@ -6,19 +6,7 @@ package org.mozilla.fenix.components
+ 
+ import android.content.Context
+ import mozilla.components.concept.fetch.Client
+-import mozilla.components.service.glean.net.ConceptFetchHttpUploader
+ import mozilla.components.support.base.log.logger.Logger
+-import mozilla.telemetry.glean.Glean
+-import mozilla.telemetry.glean.config.Configuration
+-import org.mozilla.fenix.BuildConfig
+-import org.mozilla.fenix.Config
+-import org.mozilla.fenix.GleanMetrics.GleanBuildInfo
+-import org.mozilla.fenix.GleanMetrics.Pings
+-import org.mozilla.fenix.debugsettings.gleandebugtools.DefaultGleanDebugToolsStorage
+-import org.mozilla.fenix.ext.components
+-import org.mozilla.fenix.ext.getCustomGleanServerUrlIfAvailable
+-import org.mozilla.fenix.ext.setCustomEndpointIfAvailable
+-import org.mozilla.fenix.nimbus.FxNimbus
+ 
+ /**
+  * Helper function to initialize Glean.
+@@ -27,47 +15,15 @@ import org.mozilla.fenix.nimbus.FxNimbus
+  * about initializing Glean. [isTelemetryUploadEnabled] indicate if telemetry should be enabled to be uploaded. [client]
+  * an instance of [Client] used to upload metrics.
+  */
++/**
++ * Helper function to initialize Glean.
++ *
++ * PYREVIXEN: Glean is never initialized. This is the single choke point:
++ * FenixApplication.maybeInitializeGlean() calls this function, and it is the
++ * only Glean.initialize call site in the app. The Glean SDK dependency itself
++ * is removed in fenix/app/build.gradle (see patch header for the follow-up
++ * scrub of GleanMetrics call sites).
++ */
+ fun initializeGlean(applicationContext: Context, logger: Logger, isTelemetryUploadEnabled: Boolean, client: Client) {
+-    logger.debug("Initializing Glean (uploadEnabled=$isTelemetryUploadEnabled})")
+-
+-    // for performance reasons, this is only available in Nightly or Debug builds
+-    val customEndpoint =
+-        if (Config.channel.isNightlyOrDebug) {
+-            // for testing, if custom glean server url is set in the secret menu, use it to initialize Glean
+-            getCustomGleanServerUrlIfAvailable(applicationContext)
+-        } else {
+-            null
+-        }
+-
+-    val configuration =
+-        Configuration(
+-            channel = BuildConfig.BUILD_TYPE,
+-            httpClient =
+-                ConceptFetchHttpUploader(
+-                    lazy(LazyThreadSafetyMode.NONE) { client },
+-                    supportsOhttp = true,
+-                ),
+-            enableEventTimestamps = FxNimbus.features.glean.value().enableEventTimestamps,
+-            delayPingLifetimeIo = FxNimbus.features.glean.value().delayPingLifetimeIo,
+-            pingLifetimeThreshold = FxNimbus.features.glean.value().pingLifetimeThreshold,
+-            pingLifetimeMaxTime = FxNimbus.features.glean.value().pingLifetimeMaxTime,
+-        )
+-
+-    // Since Glean v63.0.0, custom pings need to be registered prior to Glean init
+-    // in order to ensure they are enabled and able to collect data.
+-    // See https://bugzilla.mozilla.org/1934931 for more information.
+-    Glean.registerPings(Pings)
+-
+-    // Set the metric configuration from Nimbus.
+-    Glean.applyServerKnobsConfig(FxNimbus.features.glean.value().gleanMetricConfiguration.toJSONObject().toString())
+-
+-    Glean.initialize(
+-        applicationContext = applicationContext,
+-        configuration = configuration.setCustomEndpointIfAvailable(customEndpoint),
+-        uploadEnabled = isTelemetryUploadEnabled,
+-        buildInfo = GleanBuildInfo.buildInfo,
+-    )
+-
+-    // Re-apply any debug view tag persisted from a previous run so it survives the restart (Nightly/Debug only).
+-    DefaultGleanDebugToolsStorage.restorePersistedDebugViewTag(applicationContext.components.settings)
++    logger.debug("PyreVixen: Glean telemetry is disabled; initialization skipped.")
+ }
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+index 2cda573..b7239b2 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+@@ -718,7 +718,8 @@ class Settings(
+     var isTelemetryEnabled by
+         booleanPreference(
+             appContext.getPreferenceKey(R.string.pref_key_telemetry),
+-            default = true,
++            // PYREVIXEN: telemetry can never be enabled.
++            default = false,
+         )
+ 
+     var isMarketingTelemetryEnabled by

@@ -1,0 +1,140 @@
+# PyreVixen cloud build — no PC needed.
+#
+# Push to main -> GitHub Actions fetches the pinned source, applies patches,
+# builds per-ABI APKs (arm64-v8a first), signs them, and publishes a GitHub
+# Release. The user installs the APK straight from the Release page.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   ANDROID_KEYSTORE_BASE64      base64 of the release keystore file
+#   ANDROID_KEYSTORE_PASSWORD    keystore password
+#   ANDROID_KEY_ALIAS            key alias
+#   ANDROID_KEY_PASSWORD         key password
+# No secret VALUES appear in this file — only secrets.* references.
+#
+# Design notes:
+# - One build job with sequential steps (not one job per stage): the source
+#   tree is gigabytes, so passing it between jobs as an artifact would be
+#   slow and wasteful. Steps still run in the required order and any failing
+#   patch aborts the build (apply-patches.sh exits non-zero).
+# - Publishing is a SEPARATE job on purpose: creating the release from
+#   inside the long build job is unreliable (release-creation API calls can
+#   be refused there), and a failed publish can then be re-run alone without
+#   rebuilding anything.
+
+name: Build PyreVixen
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+      - 'patches/**'
+      - 'config/**'
+      - 'video-toolkit/**'
+      - 'scripts/**'
+      - 'branding/**'
+      - 'templates/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+# One release at a time; never cancel a release build mid-flight.
+concurrency:
+  group: pyrevixen-release
+  cancel-in-progress: false
+
+env:
+  BUILD_TYPE: release   # unsigned release APKs; release.sh signs them after
+
+jobs:
+  build:
+    name: Fetch, patch, build per-ABI, sign
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read pinned version
+        id: version
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          # NOTE: must match the JDK the pinned firefox-android tree wants;
+          # re-check when VERSION is bumped.
+
+      - name: Set up Android SDK
+        run: |
+          # ubuntu-latest ships a complete Android SDK; the setup-android action
+          # is broken (it tries to install the long-removed 'tools' package),
+          # so we skip it and just accept licenses — Gradle fetches anything
+          # else the build needs on its own.
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${ANDROID_HOME}" >> "$GITHUB_ENV"
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --list_installed | head -8
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Fetch source at release tag (verified)
+        run: ./scripts/fetch-source.sh
+        # GeckoView arrives as a Maven artifact; no full Gecko compile happens.
+
+      - name: Apply patches in order (010 -> 080)
+        run: ./scripts/apply-patches.sh
+        # Any patch that fails to apply exits non-zero and fails the build.
+
+      - name: Build per-ABI APKs (arm64-v8a first)
+        env:
+          SKIP_PATCHES: "1"
+          PYREVIXEN_GRADLE_ARGS: "-x :app:lintVitalRelease"
+        run: ./scripts/build.sh
+
+      - name: Decode signing keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > /tmp/pyrevixen-release.keystore
+          chmod 600 /tmp/pyrevixen-release.keystore
+          # The secret value is never printed; the file lives only for this job.
+
+      - name: Sign APKs, checksums, release notes
+        env:
+          PYREVIXEN_KEYSTORE: /tmp/pyrevixen-release.keystore
+          PYREVIXEN_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PYREVIXEN_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          PYREVIXEN_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./scripts/release.sh
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyrevixen-${{ steps.version.outputs.version }}-release
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the Release
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: pyrevixen-${{ needs.build.outputs.version }}-release
+          path: release-bundle
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.build.outputs.version }}
+          name: PyreVixen ${{ needs.build.outputs.version }} (based on Firefox ${{ needs.build.outputs.version }})
+          body_path: release-bundle/RELEASE_NOTES.md
+          files: |
+            release-bundle/pyrevixen-*-signed.apk
+            release-bundle/SHA256SUMS

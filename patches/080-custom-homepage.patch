@@ -1,0 +1,327 @@
+# =============================================================================
+# 080-custom-homepage.patch — PyreVixen: Firefox Home / blank / custom URL
+#
+# WHAT THIS DOES
+#   Adds a real custom-homepage feature (Fenix 158 has none — "homepage" upstream
+#   only means the in-app home screen / opening-screen behavior):
+#     * Default home screen (about:home, current behaviour)
+#     * Blank page (about:blank)
+#     * Custom web address (user-typed URL, https:// prepended when missing)
+#   New string prefs: pref_key_homepage_mode, pref_key_homepage_custom_url
+#   (values/preference_keys.xml) + typed Settings.kt properties (homepageMode,
+#   homepageCustomUrl, stringPreference delegates like the neighboring props).
+#   UI: a "Homepage" category in the existing Home settings screen
+#   (res/xml/home_preferences.xml, wired in HomeSettingsFragment), with the
+#   custom-URL field visible only when the custom mode is picked.
+#   Routing: FenixBrowserUseCases.resolveHomepageUrl() is used by
+#   addNewHomepageTab() and navigateToHomepage(), so every existing caller
+#   (cold start in HomeActivity, toolbar Home button, tab tray, tab cleanup,
+#   private notification, …) automatically opens the selected homepage.
+#   Settings are threaded Components -> UseCases -> FenixBrowserUseCases as a
+#   nullable param (default null) so existing unit tests keep compiling.
+#
+# VERIFIED AGAINST: FIREFOX-ANDROID_158_0_RELEASE (2026-10-14).
+#   * No custom-homepage-URL plumbing exists upstream (verified in Settings.kt,
+#     HomeSettingsFragment.kt, FenixBrowserUseCases.kt): the homepage is always
+#     ABOUT_HOME_URL (concept-engine) and the only user choice is the
+#     opening-screen behavior (shouldStartOnHome / enableHomepageAsNewTab).
+#   * Pref keys in this tree are literal strings in values/preference_keys.xml
+#     (e.g. line 452: pref_key_home); Settings.kt uses the
+#     appContext.getPreferenceKey(R.string.*) + stringPreference delegate
+#     pattern (e.g. toolbarSimpleShortcutKey).
+#   * Home settings UI is res/xml/home_preferences.xml (androidx.preference,
+#     keys as @string/pref_key_*), code-wired in
+#     HomeSettingsFragment.setupPreferences() via requirePreference.
+#   * FenixBrowserUseCases.addNewHomepageTab / navigateToHomepage are the two
+#     central homepage entry points (12 call sites total).
+#
+# DELIBERATE DEVIATIONS FROM THE FIRST DRAFT
+#   * No new fragment/XML/file: the UI extends the existing home_preferences.xml
+#     + HomeSettingsFragment instead of inventing a HomepageSettingsFragment
+#     (which would also need nav-graph wiring). No raw SharedPreferences keys:
+#     the feature uses the tree's own pref-key + Settings.kt conventions.
+#   * The first draft's "use homepage for new tabs" toggle is dropped: the
+#     task spec covers mode + custom URL routing only; intercepting the
+#     new-tab (+) button path is a separate follow-up.
+#   * shouldStartOnHome() itself is unchanged: it decides home-vs-last-tab,
+#     orthogonal to what "home" is.
+#   * New UI strings are fork-owned literals in the XML (not @string refs);
+#     move them to strings.xml when localizing.
+#
+# CONFIDENCE
+#   * All hunks CONFIDENT — contexts copied verbatim from the 158.0 tree,
+#     verified with `git apply --check`.
+#   * Behavior (not patch-text) caveats for the first CI build: ListPreference
+#     defaultValue/persistDefaultIfNotExists interplay; verify the mode summary
+#     and URL normalization on a real device.
+# =============================================================================
+
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt
+index 50d5ce2..8e859fb 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt
+@@ -167,6 +167,7 @@ class Components(
+             appStore = lazyMonitored { appStore },
+             client = lazyMonitored { core.client },
+             strictMode = lazyMonitored { strictMode },
++            settings = settings,
+         )
+     }
+ 
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/UseCases.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/UseCases.kt
+index 54d7a34..501a758 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/UseCases.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/UseCases.kt
+@@ -48,6 +48,7 @@ import org.mozilla.fenix.pbmlock.PrivateBrowsingLockUseCases
+ import org.mozilla.fenix.perf.StrictModeManager
+ import org.mozilla.fenix.perf.lazyMonitored
+ import org.mozilla.fenix.settings.downloads.DownloadLocationManager
++import org.mozilla.fenix.utils.Settings
+ import org.mozilla.fenix.wallpapers.WallpapersUseCases
+ 
+ /**
+@@ -69,6 +70,8 @@ class UseCases(
+     appStore: Lazy<AppStore>,
+     client: Lazy<Client>,
+     strictMode: Lazy<StrictModeManager>,
++    // PYREVIXEN: nullable so existing tests constructing UseCases keep compiling.
++    settings: Settings? = null,
+ ) {
+     /** Use cases that provide engine interactions for a given browser session. */
+     val sessionUseCases by lazyMonitored { SessionUseCases(store.value) }
+@@ -167,6 +170,7 @@ class UseCases(
+             searchUseCases = searchUseCases,
+             homepageTitle = context.getString(R.string.tab_tray_homepage_tab),
+             profiler = engine.value.profiler,
++            settings = settings,
+         )
+     }
+ 
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/usecases/FenixBrowserUseCases.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/usecases/FenixBrowserUseCases.kt
+index afff0fc..8418849 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/usecases/FenixBrowserUseCases.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/usecases/FenixBrowserUseCases.kt
+@@ -16,6 +16,7 @@ import mozilla.components.feature.tabs.TabsUseCases
+ import mozilla.components.support.ktx.kotlin.isUrl
+ import mozilla.components.support.ktx.kotlin.toNormalizedUrl
+ import org.mozilla.fenix.components.AppStore
++import org.mozilla.fenix.utils.Settings
+ 
+ /**
+  * Use cases for handling loading a URL and performing a search.
+@@ -34,6 +35,8 @@ class FenixBrowserUseCases(
+     private val searchUseCases: SearchUseCases,
+     private val homepageTitle: String,
+     private val profiler: Profiler?,
++    // PYREVIXEN: nullable so existing tests constructing FenixBrowserUseCases keep compiling.
++    private val settings: Settings? = null,
+ ) {
+     /**
+      * Loads a URL or performs a search depending on the value of [searchTermOrURL].
+@@ -118,7 +121,28 @@ class FenixBrowserUseCases(
+     }
+ 
+     /**
+-     * Adds a new homepage ("about:home") tab.
++     * Resolves the user-selected PyreVixen homepage URL.
++     *
++     * @return "about:blank" for the blank mode, the custom URL for the custom
++     * mode (falling back to about:home when empty), or about:home otherwise.
++     */
++    fun resolveHomepageUrl(): String {
++        return when (settings?.homepageMode) {
++            "blank" -> "about:blank"
++            "custom" -> {
++                val raw = settings.homepageCustomUrl.trim()
++                when {
++                    raw.isEmpty() -> ABOUT_HOME_URL
++                    "://" in raw -> raw
++                    else -> "https://$raw"
++                }
++            }
++            else -> ABOUT_HOME_URL
++        }
++    }
++
++    /**
++     * Adds a new homepage tab (PyreVixen: the user-selected homepage URL).
+      *
+      * @param private Whether or not the new homepage tab should be private.
+      * @param startLoading Whether the new tab should start loading immediately.
+@@ -131,7 +155,7 @@ class FenixBrowserUseCases(
+         selectTab: Boolean = true,
+     ): String {
+         return tabsUseCases.addTab.invoke(
+-            url = ABOUT_HOME_URL,
++            url = resolveHomepageUrl(),
+             title = homepageTitle,
+             selectTab = selectTab,
+             startLoading = startLoading,
+@@ -139,8 +163,8 @@ class FenixBrowserUseCases(
+         )
+     }
+ 
+-    /** Loads the homepage ("about:home"). */
++    /** Loads the homepage (PyreVixen: the user-selected homepage URL). */
+     fun navigateToHomepage() {
+-        loadUrlUseCase.invoke(url = ABOUT_HOME_URL)
++        loadUrlUseCase.invoke(url = resolveHomepageUrl())
+     }
+ }
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/settings/HomeSettingsFragment.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/settings/HomeSettingsFragment.kt
+index 51e8c5c..8763bdb 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/settings/HomeSettingsFragment.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/settings/HomeSettingsFragment.kt
+@@ -11,6 +11,8 @@ import androidx.core.content.edit
+ import androidx.navigation.findNavController
+ import androidx.navigation.fragment.navArgs
+ import androidx.preference.CheckBoxPreference
++import androidx.preference.EditTextPreference
++import androidx.preference.ListPreference
+ import androidx.preference.Preference
+ import androidx.preference.PreferenceFragmentCompat
+ import androidx.preference.SwitchPreferenceCompat
+@@ -157,6 +159,38 @@ class HomeSettingsFragment : PreferenceFragmentCompat(), SystemInsetsPaddedFragm
+ 
+         setupOpeningScreenPreferences()
+         setupWeatherPreference()
++        setupHomepagePreferences()
++    }
++
++    /**
++     * PyreVixen homepage selection: shows the custom-URL field only when the
++     * "Custom web address" mode is picked, and normalizes the stored URL.
++     */
++    private fun setupHomepagePreferences() {
++        val modePreference = requirePreference<ListPreference>(R.string.pref_key_homepage_mode)
++        val urlPreference = requirePreference<EditTextPreference>(R.string.pref_key_homepage_custom_url)
++
++        urlPreference.apply {
++            summaryProvider = EditTextPreference.SimpleSummaryProvider.getInstance()
++            onPreferenceChangeListener =
++                Preference.OnPreferenceChangeListener { preference, newValue ->
++                    val raw = (newValue as? String).orEmpty().trim()
++                    if (raw.isNotEmpty() && "://" !in raw) {
++                        (preference as EditTextPreference).text = "https://$raw"
++                    }
++                    true
++                }
++        }
++
++        fun updateUrlVisibility() {
++            urlPreference.isVisible = modePreference.value == "custom"
++        }
++        updateUrlVisibility()
++        modePreference.onPreferenceChangeListener =
++            Preference.OnPreferenceChangeListener { _, newValue ->
++                urlPreference.isVisible = newValue == "custom"
++                true
++            }
+     }
+ 
+     private fun createMetricPreferenceChangeListener(
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+index 2cda573..c28c32a 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+@@ -1066,6 +1066,29 @@ class Settings(
+             default = { openingScreenDefault == OpeningScreenOption.HOMEPAGE },
+         )
+ 
++    /**
++     * PyreVixen homepage mode: "default" (the home screen), "blank"
++     * (about:blank), or "custom" ([homepageCustomUrl]).
++     */
++    var homepageMode: String by
++        stringPreference(
++            key = appContext.getPreferenceKey(R.string.pref_key_homepage_mode),
++            default = { "default" },
++            persistDefaultIfNotExists = true,
++        )
++
++    /**
++     * PyreVixen custom homepage URL, used when [homepageMode] is "custom".
++     * Normalized by the settings UI: "https://" is prepended when the stored
++     * value has no scheme. Empty means fall back to the default home screen.
++     */
++    var homepageCustomUrl: String by
++        stringPreference(
++            key = appContext.getPreferenceKey(R.string.pref_key_homepage_custom_url),
++            default = { "" },
++            persistDefaultIfNotExists = true,
++        )
++
+     /**
+      * Indicates if the user has selected the option to never start on the home screen and have their last tab opened.
+      */
+diff --git a/mobile/android/fenix/app/src/main/res/values/arrays.xml b/mobile/android/fenix/app/src/main/res/values/arrays.xml
+index 92c8494..44ef750 100644
+--- a/mobile/android/fenix/app/src/main/res/values/arrays.xml
++++ b/mobile/android/fenix/app/src/main/res/values/arrays.xml
+@@ -52,4 +52,16 @@
+     <string name="remote_settings_server_prod">production</string>
+     <string name="remote_settings_server_dev">development</string>
+     <string name="remote_settings_server_stage">staging</string>
++
++    <!-- PyreVixen homepage mode choices (Home settings screen). -->
++    <string-array name="pyrevixen_homepage_mode_entries">
++        <item>Default home screen</item>
++        <item>Blank page</item>
++        <item>Custom web address</item>
++    </string-array>
++    <string-array name="pyrevixen_homepage_mode_values">
++        <item>default</item>
++        <item>blank</item>
++        <item>custom</item>
++    </string-array>
+ </resources>
+diff --git a/mobile/android/fenix/app/src/main/res/values/preference_keys.xml b/mobile/android/fenix/app/src/main/res/values/preference_keys.xml
+index da972b5..0255248 100644
+--- a/mobile/android/fenix/app/src/main/res/values/preference_keys.xml
++++ b/mobile/android/fenix/app/src/main/res/values/preference_keys.xml
+@@ -450,6 +450,8 @@
+     <string name="pref_key_tab_view_grid" translatable="false">pref_key_tab_view_grid</string>
+     <string name="pref_key_tabs" translatable="false">pref_key_tabs</string>
+     <string name="pref_key_home" translatable="false">pref_key_home</string>
++    <string name="pref_key_homepage_mode" translatable="false">pref_key_homepage_mode</string>
++    <string name="pref_key_homepage_custom_url" translatable="false">pref_key_homepage_custom_url</string>
+     <string name="pref_key_close_tabs_manually" translatable="false">pref_key_close_tabs_manually</string>
+     <string name="pref_key_close_tabs_after_one_day" translatable="false">pref_key_close_tabs_after_one_day</string>
+     <string name="pref_key_close_tabs_after_one_week" translatable="false">pref_key_close_tabs_after_one_week</string>
+diff --git a/mobile/android/fenix/app/src/main/res/xml/home_preferences.xml b/mobile/android/fenix/app/src/main/res/xml/home_preferences.xml
+index fa163fb..8c379b8 100644
+--- a/mobile/android/fenix/app/src/main/res/xml/home_preferences.xml
++++ b/mobile/android/fenix/app/src/main/res/xml/home_preferences.xml
+@@ -68,4 +68,32 @@
+             android:title="@string/opening_screen_after_four_hours_of_inactivity" />
+ 
+     </androidx.preference.PreferenceCategory>
++
++    <!-- PyreVixen: what the homepage IS (opening-screen radios above control
++         WHEN it opens). Titles are fork-owned literals; move to strings.xml
++         when localizing. -->
++    <androidx.preference.PreferenceCategory
++        android:layout="@layout/preference_cat_style"
++        android:title="Homepage"
++        app:allowDividerAbove="true"
++        app:iconSpaceReserved="false">
++
++        <androidx.preference.ListPreference
++            android:key="@string/pref_key_homepage_mode"
++            android:title="Homepage"
++            android:summary="What opens on launch and when you tap Home"
++            android:entries="@array/pyrevixen_homepage_mode_entries"
++            android:entryValues="@array/pyrevixen_homepage_mode_values"
++            android:defaultValue="default"
++            app:iconSpaceReserved="false" />
++
++        <androidx.preference.EditTextPreference
++            android:key="@string/pref_key_homepage_custom_url"
++            android:title="Custom web address"
++            android:dialogTitle="Custom web address"
++            android:dialogMessage="Used when Custom web address is selected above. https:// is added if you leave it out."
++            android:defaultValue=""
++            app:iconSpaceReserved="false" />
++
++    </androidx.preference.PreferenceCategory>
+ </androidx.preference.PreferenceScreen>
