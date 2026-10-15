@@ -1,0 +1,221 @@
+# =============================================================================
+# 010-branding.patch — PyreVixen: app name, package id, brand colours
+#
+# WHAT THIS DOES
+#   Renames the app to "PyreVixen", moves the Android applicationId to
+#   org.pyrevixen.browser (+ per-build-type suffixes), renames the deep-link
+#   schemes, and repoints the theme accent colours at the PyreVixen palette
+#   (Ember #E4572E, Kindled Gold #F2A541 — branding/colours.md).
+#
+#   Branding is DECIDED (2026-10-14): product name "PyreVixen", applicationId
+#   org.pyrevixen.browser (release build). If the name ever changes, see the
+#   rename table in branding/BRANDING.md.
+#
+# VERIFIED AGAINST: FIREFOX-ANDROID_158_0_RELEASE (2026-10-14).
+#   * fenix/app/build.gradle is GROOVY (not .kts): `applicationId "org.mozilla"`,
+#     per-type suffixes .fenix.debug / .fenix / .firefox_beta / .firefox,
+#     `namespace = 'org.mozilla.fenix'`, deep-link schemes fenix-nightly/beta/fenix.
+#   * app_name lives in fenix/app/src/main/res/values/static_strings.xml
+#     ("Firefox Fenix"), NOT values/strings.xml; per-channel files
+#     src/{nightly,beta,release}/res/values/static_strings.xml override it.
+#   * The launcher label/icon are on the <application> tag (AndroidManifest.xml);
+#     the .HomeActivity entry carries no label/icon of its own.
+#   * Accent colours: colors.xml accent_private_theme / accent_normal_theme rows.
+#
+# DELIBERATE DEVIATIONS FROM THE FIRST DRAFT
+#   * `namespace` is intentionally LEFT as 'org.mozilla.fenix'. The generated
+#     R and BuildConfig classes live in the namespace package, and hundreds of
+#     source files import org.mozilla.fenix.R / org.mozilla.fenix.BuildConfig
+#     (e.g. GleanHelper.kt, TrackingProtectionPolicyFactory.kt). Renaming the
+#     namespace would break every one of those imports; applicationId alone
+#     controls the install identity. Revisit only with a tree-wide import rewrite.
+#   * The manifest icon reference is intentionally UNCHANGED (@mipmap/ic_launcher).
+#     Supply PyreVixen artwork by replacing the drawables in place:
+#     res/mipmap-anydpi/ic_launcher.xml, res/drawable/ic_launcher_foreground.xml
+#     (+ seasonal variants) before building.
+#   * The <string name="firefox"> value becomes "PyreVixen" (name kept, so all
+#     R.string.firefox references keep compiling; UI shows the new brand).
+#   * sharedUserId "org.mozilla.firefox.sharedID" placeholders are REMOVED from
+#     the beta/release build types: a fresh fork must NOT share a Linux UID
+#     with Firefox.
+#
+# CONFIDENCE: all hunks CONFIDENT — every changed line was copied verbatim
+#   from the 158.0 tree on 2026-10-14 and the patch was verified with
+#   `git apply --check` against that tree.
+#   Follow-ups (not in this patch): localized values-*/strings.xml keep upstream
+#   translations (stale brand names until re-translated); a full trademark audit
+#   of user-facing strings (`grep -ri "mozilla\|firefox" fenix/app/src`).
+# =============================================================================
+
+diff --git a/mobile/android/fenix/app/build.gradle b/mobile/android/fenix/app/build.gradle
+index fd141ec..26887de 100644
+--- a/mobile/android/fenix/app/build.gradle
++++ b/mobile/android/fenix/app/build.gradle
+@@ -44,7 +44,11 @@ android {
+             arg("room.schemaLocation", "$projectDir/schemas".toString())
+         }
+ 
+-        applicationId "org.mozilla"
++        // PYREVIXEN: product applicationId (decided: org.pyrevixen.browser).
++        // Per-build-type suffixes below make the release build exactly
++        // org.pyrevixen.browser. `namespace` is deliberately unchanged
++        // (see patch header: R/BuildConfig imports).
++        applicationId "org.pyrevixen.browser"
+         minSdk config.minSdkVersion
+         targetSdk config.targetSdkVersion
+         versionCode 1
+@@ -105,14 +109,14 @@ android {
+         debug {
+             shrinkResources = false
+             minifyEnabled = false
+-            applicationIdSuffix ".fenix.debug"
++            applicationIdSuffix ".debug"
+             resValue "bool", "IS_DEBUG", "true"
+             pseudoLocalesEnabled = true
+         }
+         nightly releaseTemplate >> {
+-            applicationIdSuffix ".fenix"
++            applicationIdSuffix ".nightly"
+             buildConfigField "boolean", "USE_RELEASE_VERSIONING", "true"
+-            def deepLinkSchemeValue = "fenix-nightly"
++            def deepLinkSchemeValue = "pyrevixen-nightly"
+             buildConfigField "String", "DEEP_LINK_SCHEME", "\"$deepLinkSchemeValue\""
+             manifestPlaceholders.putAll([
+                     "deepLinkScheme": deepLinkSchemeValue
+@@ -120,35 +124,21 @@ android {
+         }
+         beta releaseTemplate >> {
+             buildConfigField "boolean", "USE_RELEASE_VERSIONING", "true"
+-            applicationIdSuffix ".firefox_beta"
+-            def deepLinkSchemeValue = "fenix-beta"
++            applicationIdSuffix ".beta"
++            def deepLinkSchemeValue = "pyrevixen-beta"
+             buildConfigField "String", "DEEP_LINK_SCHEME", "\"$deepLinkSchemeValue\""
+             manifestPlaceholders.putAll([
+-                    // This release type is meant to replace Firefox (Beta channel) and therefore needs to inherit
+-                    // its sharedUserId for all eternity. See:
+-                    // https://searchfox.org/mozilla-esr68/search?q=moz_android_shared_id&case=false&regexp=false&path=
+-                    // Shipping an app update without sharedUserId can have
+-                    // fatal consequences. For example see:
+-                    //  - https://issuetracker.google.com/issues/36924841
+-                    //  - https://issuetracker.google.com/issues/36905922
+-                    "sharedUserId": "org.mozilla.firefox.sharedID",
++                    // PYREVIXEN: fresh fork - must NOT share a UID with Firefox.
+                     "deepLinkScheme": deepLinkSchemeValue,
+             ])
+         }
+         release releaseTemplate >> {
+             buildConfigField "boolean", "USE_RELEASE_VERSIONING", "true"
+-            applicationIdSuffix ".firefox"
+-            def deepLinkSchemeValue = "fenix"
++            applicationIdSuffix ""
++            def deepLinkSchemeValue = "pyrevixen"
+             buildConfigField "String", "DEEP_LINK_SCHEME", "\"$deepLinkSchemeValue\""
+             manifestPlaceholders.putAll([
+-                    // This release type is meant to replace Firefox (Release channel) and therefore needs to inherit
+-                    // its sharedUserId for all eternity. See:
+-                    // https://searchfox.org/mozilla-esr68/search?q=moz_android_shared_id&case=false&regexp=false&path=
+-                    // Shipping an app update without sharedUserId can have
+-                    // fatal consequences. For example see:
+-                    //  - https://issuetracker.google.com/issues/36924841
+-                    //  - https://issuetracker.google.com/issues/36905922
+-                    "sharedUserId": "org.mozilla.firefox.sharedID",
++                    // PYREVIXEN: fresh fork - must NOT share a UID with Firefox.
+                     "deepLinkScheme": deepLinkSchemeValue,
+             ])
+         }
+@@ -156,7 +146,7 @@ android {
+             initWith buildTypes.nightly
+             shrinkResources = false
+             minifyEnabled = false
+-            applicationIdSuffix ".fenix"
++            applicationIdSuffix ".benchmark"
+             signingConfig = signingConfigs.debug
+             debuggable false
+             buildConfigField "boolean", "IS_BENCHMARK_BUILD", "true"
+diff --git a/mobile/android/fenix/app/src/beta/res/values/static_strings.xml b/mobile/android/fenix/app/src/beta/res/values/static_strings.xml
+index 18bddf2..33994c5 100644
+--- a/mobile/android/fenix/app/src/beta/res/values/static_strings.xml
++++ b/mobile/android/fenix/app/src/beta/res/values/static_strings.xml
+@@ -4,5 +4,5 @@
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ <resources>
+     <!-- Name of the application -->
+-    <string name="app_name" translatable="false">Firefox Beta</string>
++    <string name="app_name" translatable="false">PyreVixen</string>
+ </resources>
+diff --git a/mobile/android/fenix/app/src/main/res/values/colors.xml b/mobile/android/fenix/app/src/main/res/values/colors.xml
+index a76bc48..0ef046a 100644
+--- a/mobile/android/fenix/app/src/main/res/values/colors.xml
++++ b/mobile/android/fenix/app/src/main/res/values/colors.xml
+@@ -211,15 +211,18 @@
+     <color name="dark_grey_90_gradient_end">#0015141A</color>
+ 
+     <!-- Private theme color palette -->
+-    <color name="accent_private_theme">@color/photonViolet50</color>
+-    <color name="accent_high_contrast_private_theme">#AA71FF</color>
++    <!-- PyreVixen brand accents (branding/colours.md): Ember primary. -->
++    <color name="pyrevixen_accent">#E4572E</color>
++    <color name="pyrevixen_accent_gold">#F2A541</color>
++    <color name="accent_private_theme">@color/pyrevixen_accent</color>
++    <color name="accent_high_contrast_private_theme">@color/pyrevixen_accent</color>
+     <color name="neutral_private_theme">@color/photonGrey20</color>
+     <color name="neutral_faded_private_theme">#1FFBFBFE</color>
+     <color name="prompt_login_edit_text_cursor_color_private_theme">@color/photonViolet50</color>
+ 
+     <!-- Normal theme colors for light mode -->
+-    <color name="accent_normal_theme">@color/photonInk20</color>
+-    <color name="accent_high_contrast_normal_theme">@color/photonInk20</color>
++    <color name="accent_normal_theme">@color/pyrevixen_accent</color>
++    <color name="accent_high_contrast_normal_theme">@color/pyrevixen_accent</color>
+     <color name="neutral_normal_theme">@color/photonGrey30</color>
+     <color name="neutral_faded_normal_theme">@color/photonGrey20</color>
+     <color name="fill_link_from_clipboard_normal_theme">@color/photonInk20</color>
+diff --git a/mobile/android/fenix/app/src/main/res/values/static_strings.xml b/mobile/android/fenix/app/src/main/res/values/static_strings.xml
+index 9ad3181..62a9648 100644
+--- a/mobile/android/fenix/app/src/main/res/values/static_strings.xml
++++ b/mobile/android/fenix/app/src/main/res/values/static_strings.xml
+@@ -4,8 +4,8 @@
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ <resources xmlns:tools="http://schemas.android.com/tools">
+     <!-- Name of the application -->
+-    <string name="app_name" translatable="false">Firefox Fenix</string>
+-    <string name="firefox" translatable="false">Firefox</string>
++    <string name="app_name" translatable="false">PyreVixen</string>
++    <string name="firefox" translatable="false">PyreVixen</string>
+ 
+     <!-- Preference for developers -->
+     <string name="preference_leakcanary" translatable="false">LeakCanary</string>
+diff --git a/mobile/android/fenix/app/src/nightly/res/values/static_strings.xml b/mobile/android/fenix/app/src/nightly/res/values/static_strings.xml
+index 9e47756..33994c5 100644
+--- a/mobile/android/fenix/app/src/nightly/res/values/static_strings.xml
++++ b/mobile/android/fenix/app/src/nightly/res/values/static_strings.xml
+@@ -4,5 +4,5 @@
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ <resources>
+     <!-- Name of the application -->
+-    <string name="app_name" translatable="false">Firefox Nightly</string>
++    <string name="app_name" translatable="false">PyreVixen</string>
+ </resources>
+diff --git a/mobile/android/fenix/app/src/release/res/values/static_strings.xml b/mobile/android/fenix/app/src/release/res/values/static_strings.xml
+index c13e4d4..33994c5 100644
+--- a/mobile/android/fenix/app/src/release/res/values/static_strings.xml
++++ b/mobile/android/fenix/app/src/release/res/values/static_strings.xml
+@@ -4,5 +4,5 @@
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ <resources>
+     <!-- Name of the application -->
+-    <string name="app_name" translatable="false">Firefox</string>
++    <string name="app_name" translatable="false">PyreVixen</string>
+ </resources>
+diff --git a/mobile/android/fenix/app/src/release/AndroidManifest.xml b/mobile/android/fenix/app/src/release/AndroidManifest.xml
+--- a/mobile/android/fenix/app/src/release/AndroidManifest.xml
++++ b/mobile/android/fenix/app/src/release/AndroidManifest.xml
+@@ -8,6 +8,5 @@
+                 - https://issuetracker.google.com/issues/36924841
+                 - https://issuetracker.google.com/issues/36905922
+ -->
+-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:sharedUserId="${sharedUserId}">
++<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+ </manifest>

@@ -1,0 +1,91 @@
+# Weekly rebase check — READ-ONLY.
+#
+# Every Monday: look up the latest Firefox release version, download its
+# source, and dry-run apply patches/ against it. Reports which patches apply
+# cleanly and which fail, so the maintainer knows what needs fixing before
+# bumping VERSION.
+#
+# This workflow NEVER creates a release, NEVER pushes, and NEVER modifies
+# code. It only reports (step summary + uploaded report artifact).
+
+name: Weekly rebase check
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rebase-check:
+    name: Dry-run patches against latest Firefox
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Latest Firefox release version
+        id: latest
+        run: |
+          # product-details.mozilla.org is Mozilla's official machine-readable
+          # version feed.
+          LATEST="$(curl -fsSL https://product-details.mozilla.org/1.0/firefox_versions.json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["LATEST_FIREFOX_VERSION"])')"
+          PINNED="$(tr -d '[:space:]' < VERSION)"
+          echo "version=${LATEST}" >> "$GITHUB_OUTPUT"
+          echo "pinned=${PINNED}" >> "$GITHUB_OUTPUT"
+          echo "Latest Firefox release: ${LATEST} (pinned: ${PINNED})"
+
+      - name: Fetch latest source (does not touch VERSION)
+        env:
+          PYREVIXEN_VERSION_OVERRIDE: ${{ steps.latest.outputs.version }}
+        run: ./scripts/fetch-source.sh
+
+      - name: Dry-run each patch
+        id: check
+        run: |
+          SRC="$(tr -d '[:space:]' < .source/SOURCE_DIR)"
+          {
+            echo "# PyreVixen rebase check — $(date -u +%Y-%m-%d)"
+            echo ""
+            echo "Latest Firefox: ${{ steps.latest.outputs.version }} | pinned: ${{ steps.latest.outputs.pinned }}"
+            echo ""
+          } > report.md
+          FAILED=0
+          TOTAL=0
+          for p in patches/[0-9]*.patch; do
+            TOTAL=$((TOTAL + 1))
+            name="$(basename "$p")"
+            if patch -p1 --dry-run --directory="$SRC" < "$p" >/tmp/patch-out.txt 2>&1; then
+              echo "- PASS ${name}: applies cleanly" >> report.md
+            else
+              echo "- FAIL ${name}: does NOT apply" >> report.md
+              FAILED=$((FAILED + 1))
+            fi
+          done
+          {
+            echo ""
+            echo "Result: $((TOTAL - FAILED))/${TOTAL} patches apply cleanly."
+          } >> report.md
+          echo "failed=${FAILED}" >> "$GITHUB_OUTPUT"
+          echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
+          cat report.md
+
+      - name: Write step summary
+        if: always()
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebase-check-report
+          path: report.md
+
+      - name: Fail if any patch needs attention
+        if: steps.check.outputs.failed != '0'
+        run: |
+          echo "ERROR: ${{ steps.check.outputs.failed }}/${{ steps.check.outputs.total }} patches do not apply to Firefox ${{ steps.latest.outputs.version }}. See the report above." >&2
+          exit 1

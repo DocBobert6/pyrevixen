@@ -1,0 +1,172 @@
+# =============================================================================
+# 040-no-experiments-pocket-sponsored.patch — PyreVixen: no Studies/Nimbus,
+# no Pocket, no sponsored content
+#
+# WHAT THIS DOES
+#   1. Nimbus/Studies: remote experiments can never be fetched or applied.
+#      - BuildConfig.NIMBUS_ENDPOINT is forced to 'null' (both the .nimbus-file
+#        branch and the localProperties branch).
+#      - NimbusInterface.maybeFetchExperiments() (the only periodic-fetch call
+#        site, invoked from FenixApplication) is a no-op.
+#      - MessageNotificationWorker.tryFetchAndApplyNimbusExperiments() (the
+#        background-fetch path) returns false immediately.
+#   2. Pocket: the `homescreen` Nimbus feature's sections-enabled map defaults
+#      pocket and pocket-sponsored-stories to false (variable default + nightly
+#      channel default). This flows into Settings.homescreenSections, which
+#      gates showPocketRecommendationsFeature / showPocketSponsoredStories,
+#      which in turn gate PocketMiddleware's periodic refresh and
+#      HomeFragment.initStoriesState — Pocket never phones home.
+#   3. Sponsored tiles: Settings.showContileFeature defaults to false.
+#
+# VERIFIED AGAINST: FIREFOX-ANDROID_158_0_RELEASE (2026-10-14).
+#   * Nimbus init lives in FenixApplication.initializeNimbus()
+#     (FenixApplication.kt:726: components.nimbus.sdk + FxNimbus.initialize).
+#     The fetch paths are: maybeFetchExperiments (experiments/NimbusSetup.kt:139,
+#     called only from FenixApplication.kt:642), MessageNotificationWorker
+#     tryFetchAndApplyNimbusExperiments (:246), SplashScreenOperation
+#     applyPendingExperiments (:133, no-op when nothing was fetched), and the
+#     manual Studies screen (StudiesInteractor.kt:34, user-triggered).
+#   * Pocket gating chain (all verified): nimbus.fml.yaml `homescreen`
+#     sections-enabled -> Settings.homescreenSections (utils/Settings.kt:321)
+#     -> showPocketRecommendationsFeature (:198) / showPocketSponsoredStories
+#     (:241) -> PocketMiddleware (:75-85) + HomeFragment.initStoriesState
+#     (:1104). service-pocket is `implementation project(':components:service-pocket')`
+#     (fenix/app/build.gradle:523).
+#   * Sponsored Suggest / search suggestions are Gecko prefs, enforced via
+#     config/default-prefs.js (outside patches/).
+#
+# DELIBERATE DEVIATIONS FROM THE FIRST DRAFT
+#   * FenixApplication.initializeNimbus() is intentionally KEPT, not deleted.
+#     ~40 Settings defaults read FxNimbus.features.*.value(), which requires
+#     initialization to return the fml defaults; deleting it risks crashes that
+#     cannot be verified without a build. The privacy boundary is the fetch
+#     path, not the local-defaults lookup — and every fetch path is cut here.
+#   * Pocket is disabled at the feature-flag level rather than by deleting the
+#     service-pocket dependency: the dep removal would require synchronized
+#     surgery in Core.kt (pocketStoriesService), Components.kt:340,
+#     HomeActivity.kt:1004-1005, HomeFragment.kt (2 sites), HomeSettingsFragment.kt
+#     (2 blocks + XML), and PocketMiddleware.kt. The flag kill achieves "never
+#     phones home" in one hunk; the module remains as unreachable dead code for
+#     a follow-up cleanup patch.
+#   * The first draft's invented HomeFragment.bindHomeSections hunk is dropped
+#     (no such method exists; the real binding is initStoriesState +
+#     DefaultPocketStoriesController).
+#
+# CONFIDENCE
+#   * All hunks CONFIDENT — contexts copied verbatim from the 158.0 tree,
+#     verified with `git apply --check`.
+#   * Post-build check: fresh profile shows no Pocket section, no sponsored
+#     stories, no sponsored top sites; logcat shows no Nimbus fetch.
+# =============================================================================
+
+diff --git a/mobile/android/fenix/app/build.gradle b/mobile/android/fenix/app/build.gradle
+index fd141ec..6304af0 100644
+--- a/mobile/android/fenix/app/build.gradle
++++ b/mobile/android/fenix/app/build.gradle
+@@ -342,8 +342,4 @@ android.defaultConfig.with {
+ 
+-    try {
+-        def url = new File("${rootDir}/.nimbus").text.trim()
+-        buildConfigField 'String', 'NIMBUS_ENDPOINT', '"' + url + '"'
+-    } catch (FileNotFoundException ignored) {
+-        buildConfigField 'String', 'NIMBUS_ENDPOINT', 'null'
+-    }
++    // PYREVIXEN: Nimbus never gets a remote endpoint (no experiments).
++    buildConfigField 'String', 'NIMBUS_ENDPOINT', 'null'
+ 
+@@ -395,8 +391,4 @@ android.buildTypes.debug.with {
+ 
+-    if (gradle.hasProperty("localProperties.nimbus.remote-settings.url")) {
+-        def url = gradle.getProperty("localProperties.nimbus.remote-settings.url")
+-        buildConfigField 'String', 'NIMBUS_ENDPOINT', '"' + url + '"'
+-    } else {
+-        buildConfigField 'String', 'NIMBUS_ENDPOINT', 'null'
+-    }
++    // PYREVIXEN: Nimbus never gets a remote endpoint (no experiments).
++    buildConfigField 'String', 'NIMBUS_ENDPOINT', 'null'
+ 
+diff --git a/mobile/android/fenix/app/nimbus.fml.yaml b/mobile/android/fenix/app/nimbus.fml.yaml
+index 4d1ddfb..602bb8f 100644
+--- a/mobile/android/fenix/app/nimbus.fml.yaml
++++ b/mobile/android/fenix/app/nimbus.fml.yaml
+@@ -47,4 +47,4 @@ features:
+             "jump-back-in": true,
+-            "pocket": true,
+-            "pocket-sponsored-stories": true,
++            "pocket": false,
++            "pocket-sponsored-stories": false,
+             "synced-tabs": true,
+@@ -59,3 +59,3 @@ features:
+             "jump-back-in": true,
+-            "pocket": true,
++            "pocket": false,
+             "synced-tabs": true,
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/experiments/NimbusSetup.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/experiments/NimbusSetup.kt
+index fef47df..0478d96 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/experiments/NimbusSetup.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/experiments/NimbusSetup.kt
+@@ -143,15 +143,4 @@ fun NimbusInterface.maybeFetchExperiments(
+ ) {
+-    if (settings.nimbusUsePreview) {
+-        settings.nimbusLastFetchTime = 0L
+-        fetchExperiments()
+-    } else {
+-        val minimumPeriodMinutes = feature.refreshIntervalForeground
+-        val lastFetchTimeMillis = settings.nimbusLastFetchTime
+-        val minimumPeriodMillis = minimumPeriodMinutes * Settings.ONE_MINUTE_MS
+-
+-        if (currentTimeMillis - lastFetchTimeMillis >= minimumPeriodMillis) {
+-            settings.nimbusLastFetchTime = currentTimeMillis
+-            fetchExperiments()
+-        }
+-    }
++    // PYREVIXEN: remote experiments are disabled; never fetch.
+ }
++
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/messaging/MessageNotificationWorker.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/messaging/MessageNotificationWorker.kt
+index da844a2..5fb2dbf 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/messaging/MessageNotificationWorker.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/messaging/MessageNotificationWorker.kt
+@@ -234,30 +234,4 @@ class MessageNotificationWorker(
+         ): Boolean {
+-            val nimbusExperimentsObserver =
+-                NimbusExperimentsObserver(
+-                    nimbusSdk = nimbusSdk,
+-                    experimentsFetched = experimentsFetched,
+-                    experimentsApplied = experimentsApplied,
+-                )
+-
+-            nimbusSdk.register(nimbusExperimentsObserver)
+-
+-            return try {
+-                withTimeoutOrNull(operationTimeout) {
+-                    nimbusSdk.fetchExperiments()
+-                    LOGGER.debug("Fetching experiments.")
+-                    experimentsFetched.await()
+-
+-                    LOGGER.debug("Applying pending experiments.")
+-                    experimentsApplied.await()
+-                }
+-                experimentsApplied.isCompleted
+-            } catch (e: CancellationException) {
+-                LOGGER.warn("Nimbus experiments operation timed out.")
+-                false
+-            } finally {
+-                nimbusSdk.unregister(nimbusExperimentsObserver)
+-
+-                experimentsFetched.complete(Unit)
+-                experimentsApplied.complete(Unit)
+-            }
++            // PYREVIXEN: remote experiments are disabled; never fetch or apply.
++            return false
+         }
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+index 2cda573..ac81c90 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+@@ -2343,3 +2343,4 @@ class Settings(
+             key = appContext.getPreferenceKey(R.string.pref_key_enable_contile),
+-            default = true,
++            // PYREVIXEN: sponsored top sites are never shown.
++            default = false,
+         )

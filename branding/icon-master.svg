@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="PyreVixen placeholder icon">
+  <title>PyreVixen — placeholder launcher icon</title>
+  <desc>Original geometric mark: a fox-ear hexagon in PyreVixen Ember on Haven Night, with a Kindled Gold haven chevron. Not the Firefox logo; no Mozilla marks.</desc>
+
+  <!-- icon background -->
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="#101828"/>
+
+  <!-- fox ears (merge visually with the hexagon below) -->
+  <polygon points="160,190 128,72 248,140" fill="#E4572E"/>
+  <polygon points="352,190 384,72 264,140" fill="#E4572E"/>
+
+  <!-- hexagon ring -->
+  <polygon points="256,120 386,195 386,345 256,420 126,345 126,195"
+           fill="none" stroke="#E4572E" stroke-width="34" stroke-linejoin="round"/>
+
+  <!-- haven chevron -->
+  <polyline points="188,300 256,232 324,300"
+            fill="none" stroke="#F2A541" stroke-width="30"
+            stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
