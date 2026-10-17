@@ -1,0 +1,99 @@
+# =============================================================================
+# 070-immersive-fullscreen.patch — PyreVixen: sticky immersive + edge-to-edge
+# as the default window mode, app-wide and for HTML5 fullscreen video
+#
+# WHAT THIS DOES
+#   1. HomeActivity.onCreate(): after the edge-to-edge fragment callbacks are
+#      registered, the window enters sticky immersive mode
+#      (enterImmersiveMode from AC support-ktx). This is the app-wide default.
+#   2. BaseBrowserFragment.fullScreenChanged(): when HTML5 fullscreen ENDS, the
+#      fragment re-enters immersive mode instead of calling exitImmersiveMode(),
+#      so the app-wide immersive default survives fullscreen video.
+#
+# VERIFIED AGAINST: FIREFOX-ANDROID_158_0_RELEASE (2026-10-14).
+#   * Real fullscreen path: FullScreenFeature (feature/session) watches
+#     ContentState.fullScreen -> BaseBrowserFragment.fullScreenChanged
+#     (browser/BaseBrowserFragment.kt:2283), which calls
+#     activity.enterImmersiveMode(...) on enter and activity.exitImmersiveMode(...)
+#     on exit. The helpers live in
+#     android-components/components/support/ktx/.../view/Activity.kt
+#     (enterImmersiveMode:35, exitImmersiveMode:71) — NOT in
+#     support/base/.../ActivityExtensions.kt and NOT named enterToImmersiveMode
+#     (the first draft targeted a file/function that do not exist).
+#   * Upstream ALREADY uses the modern WindowInsetsControllerCompat API with
+#     BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE (no legacy SYSTEM_UI_FLAG_*
+#     migration needed — the first draft's premise was wrong).
+#   * HomeActivity already drives per-fragment edge-to-edge via
+#     EdgeToEdgeFragmentLifecycleCallbacks (HomeActivity.kt:486); the new
+#     enterImmersiveMode() call is placed right after that registration, which
+#     the code comments require to run after setupTheme and before setContent.
+#
+# ANDROID OS RULE (stated plainly, per the plan):
+#   An edge swipe ALWAYS briefly reveals the system bars — that is OS behaviour
+#   no app can suppress. With BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE the bars
+#   float over the content and auto-hide again without resizing the window.
+#   This patch only sets the default mode and re-hides; it does not claim to
+#   disable the swipe gesture.
+#
+# CONFIDENCE
+#   * Hunk 1 (HomeActivity import + onCreate call): CONFIDENT — contexts copied
+#     verbatim, `git apply --check` clean.
+#   * Hunk 2 (BaseBrowserFragment else-branch): context CONFIDENT; the BEHAVIOR
+#     choice (stay immersive on fullscreen exit) is best-effort by design —
+#     it is the coherent consequence of "immersive app-wide", but if testing
+#     shows dialogs/menus misbehaving after fullscreen video, revert this hunk
+#     to the upstream exitImmersiveMode() call.
+#   * No new permissions, no new dependencies.
+# =============================================================================
+
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
+index daf3317..23b3f1c 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/HomeActivity.kt
+@@ -84,6 +84,7 @@ import mozilla.components.support.ktx.android.arch.lifecycle.addObservers
+ import mozilla.components.support.ktx.android.content.call
+ import mozilla.components.support.ktx.android.content.email
+ import mozilla.components.support.ktx.android.content.share
++import mozilla.components.support.ktx.android.view.enterImmersiveMode
+ import mozilla.components.support.locale.LocaleAwareAppCompatActivity
+ import mozilla.components.support.utils.BootUtils
+ import mozilla.components.support.utils.Browsers
+@@ -485,6 +486,11 @@ open class HomeActivity : LocaleAwareAppCompatActivity(), NavHostActivity, Crash
+         // the `setContent` starts attaching fragments.
+         EdgeToEdgeFragmentLifecycleCallbacks.register(supportFragmentManager, window)
+ 
++        // PYREVIXEN: sticky immersive is the default window mode app-wide.
++        // An edge swipe still briefly reveals the system bars (OS behaviour);
++        // they auto-hide again as transient overlays.
++        enterImmersiveMode()
++
+         // Checks if Activity is currently in PiP mode if launched from external intents, then exits it
+         checkAndExitPiP()
+ 
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
+index b8b8930..d2e228e 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
+@@ -149,7 +149,6 @@ import mozilla.components.support.ktx.android.content.appName
+ import mozilla.components.support.ktx.android.content.isEdgeToEdgeDisabled
+ import mozilla.components.support.ktx.android.view.ImeInsetsSynchronizer
+ import mozilla.components.support.ktx.android.view.enterImmersiveMode
+-import mozilla.components.support.ktx.android.view.exitImmersiveMode
+ import mozilla.components.support.ktx.android.view.hideKeyboard
+ import mozilla.components.support.ktx.kotlinx.coroutines.flow.ifAnyChanged
+ import mozilla.components.support.locale.ActivityContextWrapper
+@@ -2304,8 +2303,12 @@ abstract class BaseBrowserFragment :
+ 
+             MediaState.fullscreen.record(NoExtras())
+         } else {
+-            activity.exitImmersiveMode(
+-                unregisterOnApplyWindowInsetsListener = binding.engineView::removeWindowInsetsListener
++            // PYREVIXEN: the app-wide default is immersive, so stay in immersive
++            // mode when fullscreen ends instead of revealing the system bars.
++            activity.enterImmersiveMode(
++                setOnApplyWindowInsetsListener = { key: String, listener: OnApplyWindowInsetsListener ->
++                    binding.engineView.addWindowInsetsListener(key, listener)
++                }
+             )
+ 
+             (view as? SwipeGestureLayout)?.isSwipeEnabled = true

@@ -1,0 +1,128 @@
+# =============================================================================
+# 030-no-ai.patch — PyreVixen: generative AI features default-off / removed
+#
+# WHAT THIS DOES
+#   Disables every AI code path that exists in this tree:
+#   1. The only AI Nimbus feature, `shake-to-summarize`, defaults to
+#      enabled=false on every channel (was true on developer/nightly/beta).
+#   2. No AI features are registered in Components.aiFeatureRegistry
+#      (PageSummaryFeature and VoiceSearchAIControlFeature registrations
+#      deleted). With an empty registry the AI Controls settings screen lists
+#      nothing and no AI feature can run.
+#
+# VERIFIED AGAINST: FIREFOX-ANDROID_158_0_RELEASE (2026-10-14).
+#   * Real AI surface in Fenix 158 (no chatbot sidebar exists in this tree —
+#     verified: zero "chatbot" hits in fenix/app/src/main/java):
+#       - Components.aiFeatureRegistry (components/Components.kt:499):
+#         AIFeatureRegistry.default(...).also { register(PageSummaryFeature);
+#         register(VoiceSearchAIControlFeature) }
+#       - Components.aiControlsFeatureBlock (Components.kt:514): the built-in
+#         global AI kill-switch UI (AIFeatureBlock, storage default not blocked).
+#       - Components.llm (Components.kt:523): MLPA LLM client, consumed only by
+#         SummarizationFragment (requireComponents.llm.mlpaProvider).
+#       - Nimbus feature `shake-to-summarize` (nimbus.fml.yaml:214), which feeds
+#         Settings.shakeToSummarizeFeatureFlagEnabled (utils/Settings.kt:2768).
+#   * There are NO browser.ml.* prefs in mobile/android/app/geckoview-prefs.js
+#     (the first draft's pref list was invented for the desktop pref space).
+#     browser.ml.* keys remain enforceable via config/default-prefs.js if Gecko
+#     ever honours them on Android, but no code change can target them here.
+#   * Entry points to the summary UI (browser menu item, shake gesture) are
+#     gated on the feature flags this patch turns off
+#     (SummarizationNavigator.navigateToSummarizationIfEligible checks
+#     featureEnabled; BrowserFragment gates the gesture on
+#     summarizeFeatureSettings.canShowFeature), so the unreachable UI and the
+#     `llm` client remain in the tree as dead code.
+#
+# DELIBERATE DEVIATIONS FROM THE FIRST DRAFT
+#   * The invented nimbus.fml.yaml feature stubs (chatbot / ai-tab-grouping /
+#     page-summarization) are dropped: only `shake-to-summarize` really exists.
+#   * The invented Components.kt "ChatbotController" hunk is replaced with the
+#     real aiFeatureRegistry registration block.
+#   * The invented browser.ml.* pref list is dropped (no such keys in this
+#     tree's geckoview-prefs.js).
+#
+# CONFIDENCE
+#   * Both hunks CONFIDENT — contexts copied verbatim from the 158.0 tree,
+#     verified with `git apply --check`.
+#   * Follow-up (not in this patch): deleting the now-dead Summarization*
+#     UI, the `llm` client, and the ai-controls registry classes entirely.
+#     Post-build check: the Settings "AI" entry shows no features, and no
+#     network traffic goes to any MLPA/AI endpoint.
+# =============================================================================
+
+diff --git a/mobile/android/fenix/app/nimbus.fml.yaml b/mobile/android/fenix/app/nimbus.fml.yaml
+index 4d1ddfb..2166a48 100644
+--- a/mobile/android/fenix/app/nimbus.fml.yaml
++++ b/mobile/android/fenix/app/nimbus.fml.yaml
+@@ -217,17 +217,18 @@ features:
+       enabled:
+         type: Boolean
+         description: If true, shake to summarize will be enabled
+-        default: true
++        # PYREVIXEN: AI summarization is disabled on all channels.
++        default: false
+     defaults:
+       - channel: developer
+         value:
+-          enabled: true
++          enabled: false
+       - channel: nightly
+         value:
+-          enabled: true
++          enabled: false
+       - channel: beta
+         value:
+-          enabled: true
++          enabled: false
+ 
+   weekly-privacy-notification:
+     description: A feature that shows a recurring weekly notification summarizing Tracking Protection activity.
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt
+index 50d5ce2..be36e9a 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Components.kt
+@@ -21,7 +21,6 @@ import mozilla.components.feature.addons.amo.AMOAddonsProvider
+ import mozilla.components.feature.addons.migration.DefaultSupportedAddonsChecker
+ import mozilla.components.feature.addons.update.DefaultAddonUpdater
+ import mozilla.components.feature.autofill.AutofillConfiguration
+-import mozilla.components.feature.summarize.PageSummaryFeature
+ import mozilla.components.feature.summarize.settings.SummarizationSettings
+ import mozilla.components.feature.tabdata.coordinator.DefaultTabDataCoordinator
+ import mozilla.components.feature.tabdata.coordinator.TabDataCoordinator
+@@ -100,7 +99,6 @@ import org.mozilla.fenix.perf.StartupStateProvider
+ import org.mozilla.fenix.perf.StrictModeManager
+ import org.mozilla.fenix.perf.lazyMonitored
+ import org.mozilla.fenix.reviewprompt.ReviewPromptMiddleware
+-import org.mozilla.fenix.search.VoiceSearchAIControlFeature
+ import org.mozilla.fenix.settings.emailmasks.middleware.DefaultEmailMasksRepository
+ import org.mozilla.fenix.settings.emailmasks.middleware.EmailMasksRepository
+ import org.mozilla.fenix.settings.settingssearch.DefaultFenixSettingsIndexer
+@@ -109,7 +107,6 @@ import org.mozilla.fenix.termsofuse.store.DefaultTermsOfUsePromptRepository
+ import org.mozilla.fenix.utils.Settings
+ import org.mozilla.fenix.utils.isLargeScreenSize
+ import org.mozilla.fenix.wifi.WifiConnectionMonitor
+-import org.mozilla.gecko.search.SearchWidgetProvider
+ 
+ private const val AMO_COLLECTION_MAX_CACHE_AGE = 2 * 24 * 60L // Two days in minutes
+ 
+@@ -497,17 +494,9 @@ class Components(
+     }
+ 
+     val aiFeatureRegistry by lazyMonitored {
+-        AIFeatureRegistry.default(scope = applicationScope, context = context).also {
+-            if (settings.shakeToSummarizeFeatureFlagEnabled) {
+-                it.register(PageSummaryFeature(summarizationSettings))
+-            }
+-            it.register(
+-                VoiceSearchAIControlFeature(
+-                    settings = settings,
+-                    onUpdateWidget = { SearchWidgetProvider.updateAllWidgets(context) },
+-                )
+-            )
+-        }
++        // PYREVIXEN: no AI features are registered. With an empty registry the
++        // AI Controls screen lists nothing and no AI feature can run.
++        AIFeatureRegistry.default(scope = applicationScope, context = context)
+     }
+ 
+     @Suppress("unused")

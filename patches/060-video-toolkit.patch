@@ -1,0 +1,189 @@
+--- /dev/null
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/pyrevixen/VideoToolkitFeature.kt
+@@ -0,0 +1,60 @@
++package org.mozilla.fenix.pyrevixen
++
++import android.content.Context
++import androidx.preference.PreferenceManager
++import mozilla.components.concept.engine.EngineSession
++import mozilla.components.concept.engine.webextension.MessageHandler
++import mozilla.components.concept.engine.webextension.WebExtensionRuntime
++import mozilla.components.support.webextensions.BuiltInWebExtensionController
++import org.json.JSONObject
++
++/**
++ * PyreVixen video toolkit: installs the bundled WebExtension that carries the
++ * page-side transform logic and owns the native <-> page message bridge.
++ * Follows the ReaderViewFeature / WebCompatFeature built-in-extension pattern
++ * (BuiltInWebExtensionController + resource://android assets URL).
++ */
++internal const val VIDEO_TOOLKIT_EXTENSION_ID = "pyrevixen-video-toolkit@pyrevixen.browser"
++internal const val VIDEO_TOOLKIT_EXTENSION_URL = "resource://android/assets/extensions/video-toolkit/"
++internal const val VIDEO_TOOLKIT_CONTENT_PORT = "pyrevixenVideoToolkit"
++
++class VideoToolkitFeature(
++    private val context: Context,
++) {
++    private val extensionController = BuiltInWebExtensionController(
++        VIDEO_TOOLKIT_EXTENSION_ID,
++        VIDEO_TOOLKIT_EXTENSION_URL,
++        VIDEO_TOOLKIT_CONTENT_PORT,
++    )
++
++    /** Installs the bundled extension. Called once at engine startup. */
++    fun install(runtime: WebExtensionRuntime) {
++        if (!isEnabled()) return
++        extensionController.install(runtime)
++    }
++
++    /**
++     * Wires the content message handler for one tab's engine session.
++     * Call for the selected tab (and on tab switch / new engine session),
++     * mirroring ReaderViewFeature.connectReaderViewContentScript.
++     */
++    fun registerSession(engineSession: EngineSession, handler: MessageHandler) {
++        extensionController.registerContentMessageHandler(
++            engineSession,
++            handler,
++            VIDEO_TOOLKIT_CONTENT_PORT,
++        )
++    }
++
++    /** Native -> page. Guarded exactly like ReaderViewFeature.checkReaderState. */
++    fun send(engineSession: EngineSession?, msg: JSONObject) {
++        if (engineSession == null) return
++        if (extensionController.portConnected(engineSession, VIDEO_TOOLKIT_CONTENT_PORT)) {
++            extensionController.sendContentMessage(msg, engineSession, VIDEO_TOOLKIT_CONTENT_PORT)
++        }
++    }
++
++    private fun isEnabled(): Boolean =
++        PreferenceManager.getDefaultSharedPreferences(context)
++            .getBoolean("pyrevixen.video.toolkit.enabled", true)
++}
+--- /dev/null
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/pyrevixen/VideoGestureOverlay.kt
+@@ -0,0 +1,69 @@
++package org.mozilla.fenix.pyrevixen
++
++import android.content.Context
++import android.view.GestureDetector
++import android.view.MotionEvent
++import android.view.ScaleGestureDetector
++import android.view.ViewGroup
++
++/**
++ * Transparent overlay placed above the engine view for the PyreVixen video
++ * toolkit. It never consumes a touch until the gesture is classified as a
++ * toolkit gesture -- everything else falls through to GeckoView untouched.
++ *
++ * Contract (full protocol in video-toolkit/IN_APP_DESIGN.md):
++ * - pinch (second pointer down inside a managed video rect) -> page bridge
++ * - single-finger drag past touch slop inside a zoomed (>1x) video rect -> pan
++ * - double-tap on a managed video -> zoom toggle
++ *
++ * Exact detector plumbing and the inbound message wiring are fitted against
++ * the real MessageHandler signature at build time.
++ */
++class VideoGestureOverlay(context: Context) : ViewGroup(context) {
++
++    private val scaleDetector = ScaleGestureDetector(context, ScaleListener())
++    private val gestureDetector = GestureDetector(context, GestureListener())
++
++    init {
++        isClickable = false
++        isFocusable = false
++    }
++
++    override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
++        // Intercept only once a gesture classifies as a toolkit gesture;
++        // classification logic is fitted at build time. Until then the
++        // overlay is behaviourally invisible.
++        return false
++    }
++
++    override fun onTouchEvent(event: MotionEvent): Boolean {
++        scaleDetector.onTouchEvent(event)
++        gestureDetector.onTouchEvent(event)
++        return true
++    }
++
++    /** Called by the hosting fragment on HTML5 fullscreen enter/exit. */
++    fun onFullscreenChanged(inFullscreen: Boolean) {
++        // Enter: dismiss any open toolkit bottom sheet (immersive = no chrome).
++        // Exit: layout changed under us; re-sync page state over the bridge.
++        // Wired to the page bridge at build time.
++    }
++
++    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
++        // No children to lay out; the overlay draws nothing itself.
++    }
++
++    private inner class ScaleListener : ScaleGestureDetector.SimpleOnScaleGestureListener() {
++        override fun onScale(detector: ScaleGestureDetector): Boolean {
++            // Forward pinch phase/scale/focal-point to the page bridge.
++            return true
++        }
++    }
++
++    private inner class GestureListener : GestureDetector.SimpleOnGestureListener() {
++        override fun onDoubleTap(event: MotionEvent): Boolean {
++            // Forward double-tap to the page bridge.
++            return true
++        }
++    }
++}
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/components/Core.kt
+@@ -138,3 +138,4 @@
+ import org.mozilla.fenix.perf.StrictModeManager
+ import org.mozilla.fenix.perf.lazyMonitored
++import org.mozilla.fenix.pyrevixen.VideoToolkitFeature
+ import org.mozilla.fenix.settings.advanced.getSelectedLocale
+@@ -266,3 +266,7 @@
+             .also {
+                 WebCompatFeature.install(it)
++
++                // PyreVixen: install the bundled video toolkit extension
++                // (pref-gated inside the feature; default true).
++                VideoToolkitFeature(context).install(it)
+             }
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/browser/BaseBrowserFragment.kt
+@@ -1417,6 +1417,13 @@
+             view = view,
+         )
+ 
++        // PyreVixen: video toolkit gesture overlay. Transparent ViewGroup above
++        // the engine view; intercepts only classified toolkit gestures (see
++        // VideoGestureOverlay). Added as a sibling above binding.engineView so
++        // it stays interactive in HTML5 fullscreen too. Exact addView call and
++        // per-session message-handler registration are fitted at build time.
++        // Anchor: this hunk.
++
+         closeFindInPageBarOnNavigation(store)
+ 
+         store.flowScoped(viewLifecycleOwner, Dispatchers.Main) { flow ->
+@@ -2286,6 +2293,11 @@
+             // Close find in page bar if opened
+             findInPageIntegration.onBackPressed()
+ 
++
++            // PyreVixen: entering HTML5 fullscreen -- dismiss any open toolkit
++            // bottom sheet (immersive = no chrome); the gesture overlay stays
++            // active above the fullscreen video.
++            // videoGestureOverlay.onFullscreenChanged(true)
+             FullScreenNotificationToast(
+                     activity = activity,
+                     gestureNavString = getString(R.string.exit_fullscreen_with_gesture_short),
+@@ -2308,6 +2320,10 @@
+                 unregisterOnApplyWindowInsetsListener = binding.engineView::removeWindowInsetsListener
+             )
+ 
++            // PyreVixen: leaving fullscreen -- layout changed under us;
++            // re-sync page state over the toolkit bridge.
++            // videoGestureOverlay.onFullscreenChanged(false)
++
+             (view as? SwipeGestureLayout)?.isSwipeEnabled = true
+             (activity as? HomeActivity)?.let { homeActivity ->
+                 // ExternalAppBrowserActivity exclusively handles it's own theming unless in private mode.

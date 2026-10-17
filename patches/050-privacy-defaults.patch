@@ -1,0 +1,68 @@
+# =============================================================================
+# 050-privacy-defaults.patch — PyreVixen: hardened privacy defaults
+#
+# WHAT THIS DOES
+#   Makes the hardened privacy posture the DEFAULT for every fresh profile:
+#     * Enhanced Tracking Protection = Strict
+#       (useStrictTrackingProtection default false -> true,
+#        useStandardTrackingProtection default true -> false)
+#     * HTTPS-Only mode on (shouldUseHttpsOnly default false -> true)
+#   Total Cookie Protection needs no code change: TrackingProtectionPolicyFactory
+#   applies CookiePolicy.ACCEPT_FIRST_PARTY_AND_ISOLATE_OTHERS to every policy
+#   via applyTCPIfNeeded() regardless of mode (verified in
+#   components/TrackingProtectionPolicyFactory.kt).
+#
+# VERIFIED AGAINST: FIREFOX-ANDROID_158_0_RELEASE (2026-10-14).
+#   * The real default-policy site is
+#     fenix/app/src/main/java/org/mozilla/fenix/components/TrackingProtectionPolicyFactory.kt
+#     createTrackingProtectionPolicy(), which branches on
+#     settings.useStrictTrackingProtection (Strict) vs useCustomTrackingProtection
+#     (custom) vs recommended() — the first draft's
+#     android-components/.../engine-gecko/EngineProvider.kt target does not
+#     exist in this tree (the engine is constructed via fenix GeckoProvider,
+#     which takes the policy built by this factory).
+#   * Settings.kt: useStandardTrackingProtection (:1344, default true),
+#     useStrictTrackingProtection (:1350, default false),
+#     shouldUseHttpsOnly (:1289, default false).
+#   * The remaining enforcement (browser.contentblocking.category="strict",
+#     dom.security.https_only_mode, network.cookie.cookieBehavior=5, …) is
+#     Gecko prefs via config/default-prefs.js (outside patches/).
+#
+# CONFIDENCE: all hunks CONFIDENT — contexts copied verbatim from the 158.0
+#   tree, verified with `git apply --check`.
+#   Post-build check: fresh profile -> Tracking Protection settings show
+#   "Strict" selected; http:// URLs upgrade under HTTPS-Only.
+# =============================================================================
+
+diff --git a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+index 2cda573..69d1f16 100644
+--- a/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
++++ b/mobile/android/fenix/app/src/main/java/org/mozilla/fenix/utils/Settings.kt
+@@ -1289,7 +1289,8 @@ class Settings(
+     var shouldUseHttpsOnly by
+         booleanPreference(
+             appContext.getPreferenceKey(R.string.pref_key_https_only),
+-            default = false,
++            // PYREVIXEN: HTTPS-Only mode is on by default.
++            default = true,
+         )
+ 
+     var shouldUseHttpsOnlyInAllTabs by
+@@ -1344,13 +1345,15 @@ class Settings(
+     val useStandardTrackingProtection by
+         booleanPreference(
+             appContext.getPreferenceKey(R.string.pref_key_tracking_protection_standard_option),
+-            true,
++            // PYREVIXEN: Enhanced Tracking Protection defaults to Strict.
++            false,
+         )
+ 
+     val useStrictTrackingProtection by
+         booleanPreference(
+             appContext.getPreferenceKey(R.string.pref_key_tracking_protection_strict_default),
+-            false,
++            // PYREVIXEN: Enhanced Tracking Protection defaults to Strict.
++            true,
+         )
+ 
+     val useCustomTrackingProtection by
